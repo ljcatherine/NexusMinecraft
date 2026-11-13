@@ -12,3 +12,4 @@ data/
 *.key
 release.tar.gz
 *-dist.tar.gz
+*.tar.gz
