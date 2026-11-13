@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import re
@@ -11,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import yaml
@@ -20,6 +21,7 @@ from starlette.concurrency import run_in_threadpool
 from .auth import Auth, RateLimited
 from .storage import safe_path, protected, atomic_write, atomic_write_stream, validate_text, properties, update_properties, SECRET
 from . import system, rcon, minecraft
+from .marketplace import Marketplace, MarketError, detect as detect_software
 from .limits import AuthenticationBodyLimit, UploadRequestLimit
 
 
@@ -64,12 +66,22 @@ class Invitation(BaseModel):
     role: str = 'admin'
 
 
+class MarketInstall(BaseModel):
+    source: str = Field(max_length=16)
+    project: str = Field(max_length=96)
+    version_id: str = Field(max_length=96)
+    software: str = Field(max_length=16)
+    version: str | None = Field(default=None, max_length=12)
+    confirmed: bool = False
+    allow_unverified: bool = False
+
+
 class RedeemInvitation(BaseModel):
     token: str = Field(min_length=32,max_length=128)
     password: str = Field(min_length=12,max_length=1024)
 
 
-def create_app(config=None):
+def create_app(config=None, market=None):
     if config is None:
         config = json.loads(Path(os.environ.get('PS5_PANEL_CONFIG', 'config.example.json')).read_text())
     if config.get('public_access') and (config.get('bind') != '127.0.0.1' or not config.get('secure_cookie') or not config.get('origin','').startswith('https://')):
@@ -77,6 +89,7 @@ def create_app(config=None):
     data = Path(config['data'])
     data.mkdir(parents=True, exist_ok=True)
     auth = Auth(data / 'panel.sqlite3')
+    market = market or Marketplace()
     cache = {'host': {}, 'servers': {}, 'error': None}
     locks = {key: asyncio.Lock() for key in config['servers']}
     jobs = {}
@@ -489,6 +502,12 @@ def create_app(config=None):
         if (Path(filename).name != filename or '/' in filename or '\\' in filename
                 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_. -]{0,123}\.jar', filename, re.I)):
             raise ValueError('Choose a JAR file with a simple filename')
+        size = await install_jar(sid, srv, folder_name, filename, file.file)
+        auth.audit(actor['name'], 'extension.install', sid+':'+folder_name+'/'+filename)
+        return {'ok': True, 'name': filename, 'directory': folder_name, 'size': size, 'restart_required': True}
+
+    async def install_jar(sid, srv, folder_name, filename, stream):
+        """Write a JAR into plugins/ or mods/ atomically; shared by uploads and the marketplace."""
         async with locks[sid]:
             root = safe_path(srv['root'])
             folder = safe_path(root, folder_name)
@@ -498,18 +517,55 @@ def create_app(config=None):
                 raise ValueError('Extension directory is unavailable')
             if any(path.name.casefold() == filename.casefold() for path in folder.iterdir()):
                 raise HTTPException(409, 'An extension with that filename already exists; remove or rename it first')
-            file.file.seek(0, 2)
-            size = file.file.tell()
-            file.file.seek(0)
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(0)
             if size == 0 or size > 64 * 1024 * 1024:
                 raise ValueError('JAR must be non-empty and no larger than 64 MiB')
-            with zipfile.ZipFile(file.file) as jar:
+            with zipfile.ZipFile(stream) as jar:
                 if not jar.infolist() or len(jar.infolist()) > 50000:
                     raise ValueError('JAR must contain 1–50,000 entries')
-            file.file.seek(0)
-            atomic_write_stream(folder / filename, file.file, 64 * 1024 * 1024)
-        auth.audit(actor['name'], 'extension.install', sid+':'+folder_name+'/'+filename)
-        return {'ok': True, 'name': filename, 'directory': folder_name, 'size': size, 'restart_required': True}
+            stream.seek(0)
+            atomic_write_stream(folder / filename, stream, 64 * 1024 * 1024)
+        return size
+
+    @app.get('/api/servers/{sid}/marketplace/context')
+    def market_context(sid: str, request: Request):
+        user(request)
+        srv = server(sid)
+        return {**detect_software(srv), 'directory': 'mods' if srv['legacy'] else 'plugins'}
+
+    @app.get('/api/servers/{sid}/marketplace/search')
+    def market_search(sid: str, request: Request, source: str, software: str, q: str = '', version: str = '', offset: int = 0):
+        user(request)
+        server(sid)
+        return market.search(source, q, software, version or None, offset)
+
+    @app.get('/api/servers/{sid}/marketplace/versions')
+    def market_versions(sid: str, request: Request, source: str, project: str, software: str, version: str = ''):
+        user(request)
+        server(sid)
+        return [{k: v for k, v in item.items() if k not in ('url', 'hash')} | {'hash_algorithm': item['hash'][0] if item['hash'] else None}
+                for item in market.versions(source, project, software, version or None)]
+
+    @app.post('/api/servers/{sid}/marketplace/install')
+    async def market_install(sid: str, body: MarketInstall, request: Request):
+        actor = user(request, True)
+        srv = server(sid)
+        if not body.confirmed:
+            raise ValueError('Confirm that you trust this plugin and its source before installing')
+        folder_name = 'mods' if srv['legacy'] else 'plugins'
+        filename, content, record = await run_in_threadpool(market.fetch, body.source, body.project, body.version_id,
+                                                            body.software, body.version, body.allow_unverified)
+        size = await install_jar(sid, srv, folder_name, filename, io.BytesIO(content))
+        auth.audit(actor['name'], 'extension.install', f"{sid}:{folder_name}/{filename} from {record['source']}:{record['project']}@{record['version']} sha256={record['sha256']}{'' if record['verified'] else ' unverified'}")
+        return {'ok': True, 'name': filename, 'directory': folder_name, 'size': size, 'restart_required': True, **record}
+
+    @app.get('/api/marketplace/icon')
+    def market_icon(request: Request, url: str):
+        user(request)
+        body, kind = market.icon(url)
+        return Response(body, media_type=kind, headers={'Cache-Control': 'private, max-age=86400'})
 
     @app.get('/api/backups')
     def backups(request: Request, path: str = ''):

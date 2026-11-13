@@ -34,7 +34,7 @@ Status, live console, players, files, backups and host health for existing syste
 | 👥 | **Players** | Who's online, whitelist, ops and bans, each action confirmed. |
 | 📁 | **Files** | Browse and edit server files with revision checks, path confinement and syntax preview for JSON, YAML and properties. |
 | 🗄️ | **Backups** | Your existing nightly maintenance sets, inspection and logs. No second backup scheduler. |
-| 🧩 | **Extensions** | Installed plugins or Forge mods, and trusted JAR uploads. |
+| 🧩 | **Extensions** | Search and install plugins and mods from Modrinth, Hangar and SpigotMC, filtered to your server's software (Paper, Purpur, Folia, Spigot, Bukkit, Forge, Fabric…) and Minecraft version. Downloads are checksum-verified before they're installed. Plus installed JARs and manual uploads. |
 | 🩺 | **Diagnostics** | Read-only checks of units, paths, permissions and RCON reachability. |
 | 🔑 | **Accounts** | Named admin and viewer accounts, private single-use invitations, and an audit log of every change. |
 
@@ -111,6 +111,8 @@ Point `PS5_PANEL_CONFIG` at a private development config with local directories,
 
 > [!CAUTION]
 > Never forward the panel, RCON or Minecraft management ports to the internet. Publish the panel only through Cloudflare Access or a VPN.
+
+The plugin browser only ever contacts Modrinth, Hangar and Spiget over HTTPS, re-checking every redirect, and the browser never supplies a download URL: the server looks the file up itself, checks its SHA-512 or SHA-256, and confirms it contains a plugin or mod descriptor before writing it. SpigotMC publishes no checksums, so those installs need an extra confirmation.
 
 Sessions, CSRF tokens and the audit log live in SQLite. State-changing requests need a matching origin and CSRF token, file operations are confined to each server's root, and privileged actions go through a helper that hard-codes the allowed units. The [security folder](security) holds the threat model, audits and test results; [docs/SECURITY.md](docs/SECURITY.md) summarises the boundaries.
 
