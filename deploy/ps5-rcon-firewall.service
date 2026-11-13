@@ -1,0 +1,12 @@
+[Unit]
+Description=Restrict Minecraft RCON to loopback
+Before=mc-vanilla.service mc-skyfactory.service
+After=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/ps5-rcon-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

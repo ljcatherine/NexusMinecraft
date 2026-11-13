@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+frontend/dist/
+data/
+*.pyc
+.env
+
+# Local secrets and build output
+*.pem
+*.key
+release.tar.gz
+*-dist.tar.gz

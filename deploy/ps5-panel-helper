@@ -1,0 +1,159 @@
+#!/usr/bin/python3 -I
+"""Root-owned helper. No shell, configurable units, command strings or paths."""
+import fcntl
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+UNITS = {'mc-vanilla.service', 'mc-skyfactory.service'}
+ROOTS = {'survival': Path('/srv/minecraft/vanilla'), 'skyfactory': Path('/srv/minecraft/skyfactory')}
+BACKUPS = Path('/srv/minecraft/backups')
+
+
+def ctl(*args):
+    return subprocess.run(['/usr/bin/systemctl', *args], check=True, capture_output=True, text=True, timeout=240).stdout
+
+
+def archive_path(name):
+    candidate = Path(name)
+    if candidate.is_absolute() or '..' in candidate.parts or len(candidate.parts) != 2 or candidate.name not in ('vanilla.tar.gz','skyfactory.tar.gz'):
+        raise ValueError('Only original complete backup archives are accepted')
+    path = BACKUPS
+    for part in candidate.parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError('Symlinks forbidden')
+    if not (path.parent / '.complete').is_file() or not path.is_file():
+        raise ValueError('A completed backup set is required')
+    return path
+
+
+def restore(sid, name):
+    target = ROOTS[sid]
+    source = archive_path(name)
+    if source.name != ('vanilla.tar.gz' if sid == 'survival' else 'skyfactory.tar.gz'):
+        raise ValueError('Archive belongs to another server')
+    if target.is_symlink() or target.resolve() != target:
+        raise ValueError('Server root must be a real directory')
+    unit = 'mc-vanilla.service' if sid == 'survival' else 'mc-skyfactory.service'
+    stamp = str(time.time_ns())
+    staging = target.parent / ('.panel-staging-' + sid + '-' + stamp)
+    rollback = target.parent / ('.panel-rollback-' + sid + '-' + stamp)
+    staging.mkdir(mode=0o700)
+    stopped, swapped = False, False
+    was_active = subprocess.run(['/usr/bin/systemctl','is-active','--quiet',unit]).returncode == 0
+    try:
+        # Validate and stage every regular file, never extract links/devices or permissions.
+        total, count = 0, 0
+        with tarfile.open(source, 'r|gz') as archive:
+            for member in archive:
+                rel = Path(member.name)
+                if rel.is_absolute() or '..' in rel.parts or '\\' in member.name or not (member.isdir() or member.isfile()):
+                    raise ValueError('Unsafe archive entry')
+                parts = list(rel.parts)
+                # Existing maintenance uses tar -C server_directory .; accept root wrapper too.
+                if parts and parts[0] == target.name:
+                    parts.pop(0)
+                if not parts:
+                    continue
+                dest = staging.joinpath(*parts)
+                count += 1
+                total += member.size
+                if count > 1000000 or total > 200 * 1024**3:
+                    raise ValueError('Archive exceeds restore limit')
+                if member.isdir():
+                    dest.mkdir(parents=True, exist_ok=True, mode=0o750)
+                else:
+                    if shutil.disk_usage(staging).free < member.size + 2*1024**3:
+                        raise ValueError('Insufficient free space; preserve a 2 GiB host reserve')
+                    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+                    with archive.extractfile(member) as src, dest.open('xb') as out:
+                        shutil.copyfileobj(src, out, 1024*1024)
+                    os.chmod(dest, 0o750 if member.mode & 0o111 else 0o640)
+        expected = 'server.jar' if sid == 'survival' else 'forge-1.12.2-14.23.5.2860.jar'
+        if not (staging/expected).is_file() or not (staging/'server.properties').is_file():
+            raise ValueError('Archive lacks required server files')
+        account = pwd.getpwnam('ps5')
+        for directory, folders, files in os.walk(staging):
+            os.chown(directory, account.pw_uid, account.pw_gid)
+            os.chmod(directory, 0o750)
+            for filename in files:
+                os.chown(Path(directory)/filename, account.pw_uid, account.pw_gid)
+        # Preserve current RCON settings so restoring cannot re-expose old credentials.
+        current = (target/'server.properties').read_text()
+        restored = (staging/'server.properties').read_text()
+        private = {}
+        for line in current.splitlines():
+            if '=' in line and line.split('=',1)[0] in ('enable-rcon','rcon.port','rcon.password'):
+                key,value = line.split('=',1)
+                private[key] = value
+        lines = [line for line in restored.splitlines() if line.split('=',1)[0] not in private]
+        (staging/'server.properties').write_text('\n'.join(lines+[k+'='+v for k,v in private.items()])+'\n')
+        ctl('stop', unit)
+        stopped = True
+        if subprocess.run(['/usr/bin/systemctl','is-active','--quiet',unit]).returncode == 0:
+            raise RuntimeError('Server did not stop')
+        target.rename(rollback)
+        try:
+            staging.rename(target)
+        except Exception:
+            rollback.rename(target)
+            raise
+        swapped = True
+        subprocess.run(['/usr/bin/setfacl','-R','-m','u:ps5-panel:rwX',str(target)],check=True,timeout=120)
+        for directory,_,_ in os.walk(target):
+            subprocess.run(['/usr/bin/setfacl','-m','d:u:ps5-panel:rwx',directory],check=True,timeout=10)
+        if was_active:
+            ctl('start', unit)
+        print('Restored. Rollback snapshot retained at '+str(rollback))
+        print('Original service state restored. Check console for Minecraft readiness.')
+    except Exception:
+        if swapped:
+            ctl('stop', unit)
+            target.rename(staging)
+            rollback.rename(target)
+        if stopped and was_active:
+            ctl('start', unit)
+        raise
+    finally:
+        # Staging is always a freshly created, validated child; never user supplied.
+        if staging.is_dir() and not staging.is_symlink():
+            shutil.rmtree(staging)
+
+
+def main(args):
+    if os.geteuid() != 0:
+        raise ValueError('Root invocation required')
+    os.environ.clear()
+    os.environ.update({'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C.UTF-8'})
+    if len(args) == 2 and args[0] in ('start','stop','restart') and args[1] in UNITS | {'minecraft-maintenance.service'}:
+        if args[1] == 'minecraft-maintenance.service' and args[0] != 'start':
+            raise ValueError('Maintenance may only be started')
+    elif len(args) == 3 and args[0] == 'restore' and args[1] in ROOTS:
+        archive_path(args[2])
+    else:
+        raise ValueError('Operation not allowed')
+    with open('/run/lock/ps5-panel.lock','a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if subprocess.run(['/usr/bin/systemctl','is-active','--quiet','minecraft-maintenance.service']).returncode == 0:
+            raise ValueError('Maintenance is running; retry later')
+        with open(BACKUPS/'.maintenance.lock','a') as maintenance:
+            fcntl.flock(maintenance, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if args[0] == 'restore':
+                restore(args[1],args[2])
+            else:
+                ctl('--no-block',args[0],args[1])
+                print('Service operation queued')
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except Exception as exc:
+        print('Operation refused or failed: '+str(exc), file=sys.stderr)
+        sys.exit(1)

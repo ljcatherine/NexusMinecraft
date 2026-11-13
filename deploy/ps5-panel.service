@@ -1,0 +1,32 @@
+[Unit]
+Description=Nexus Minecraft panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ps5-panel
+Group=ps5-panel
+SupplementaryGroups=ps5 systemd-journal
+WorkingDirectory=/opt/ps5-server-panel
+Environment=PS5_PANEL_CONFIG=/etc/ps5-panel/config.json
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/ps5-server-panel/.venv/bin/python -m panel.serve
+Restart=on-failure
+RestartSec=5
+UMask=0027
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ps5-panel /srv/minecraft /run/lock
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryMax=768M
+TasksMax=128
+# sudo is required for the root-owned allowlisted helper; NoNewPrivileges cannot be enabled.
+
+[Install]
+WantedBy=multi-user.target

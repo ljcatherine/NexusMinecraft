@@ -1,0 +1,14 @@
+{
+  "bind": "127.0.0.1",
+  "port": 8080,
+  "origin": "https://minecraft.example.com",
+  "secure_cookie": true,
+  "restore_enabled": false,
+  "data": "/var/lib/ps5-panel",
+  "backups": "/srv/minecraft/backups",
+  "helper": "/usr/local/libexec/ps5-panel-helper",
+  "servers": {
+    "survival": {"name":"Survival", "unit":"mc-vanilla.service", "root":"/srv/minecraft/vanilla", "port":25565, "rcon_port":25575, "java":"/usr/lib/jvm/temurin-25-jdk-amd64/bin/java", "jar":"server.jar", "world":"world", "legacy":false},
+    "skyfactory": {"name":"SkyFactory 4", "unit":"mc-skyfactory.service", "root":"/srv/minecraft/skyfactory", "port":25566, "rcon_port":25576, "java":"/usr/lib/jvm/temurin-8-jdk-amd64/bin/java", "jar":"forge-1.12.2-14.23.5.2860.jar", "world":"skyfactory_world", "legacy":true}
+  }
+}
